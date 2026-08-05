@@ -20,7 +20,6 @@ export default ({ config }: { config: ExpoConfig }): ExpoConfig => {
     ...config,
     name: "Bunkialo2",
     slug: "Bunkialo2",
-    owner: "ialexpo",
     orientation: "portrait",
     icon: "./src/assets/images/icon.png",
     scheme: "bunkialo",
@@ -83,13 +82,13 @@ export default ({ config }: { config: ExpoConfig }): ExpoConfig => {
     extra: {
       router: {},
       eas: {
-        projectId: "7cbe49d9-9827-4df3-b86e-849443804d63",
+        projectId: "f08b6c23-02ea-4ec6-ae21-62dd67f2b30e",
       },
     },
     // Expo Go needs the SDK runtime; EAS builds keep the app runtime contract.
     runtimeVersion: isExpoGoPreview ? { policy: "sdkVersion" } : "1.2.0",
     updates: {
-      url: "https://u.expo.dev/7cbe49d9-9827-4df3-b86e-849443804d63",
+      url: "https://u.expo.dev/f08b6c23-02ea-4ec6-ae21-62dd67f2b30e",
     },
 
     version: pkgVersion,
