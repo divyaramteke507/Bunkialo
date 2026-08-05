@@ -1,0 +1,160 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Bump Version (OTA patch)",
+      "type": "shell",
+      "command": "bun",
+      "args": ["x", "npm", "version", "patch", "--no-git-tag-version"],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "never",
+        "panel": "new",
+        "close": true
+      }
+    },
+    {
+      "label": "OTA update ",
+      "type": "shell",
+      "command": "eas",
+      "args": [
+        "update",
+        "--branch",
+        "production",
+        "--message",
+        "${input:updateMessage}"
+      ],
+      "dependsOn": ["Bump Version (OTA patch)"],
+      "dependsOrder": "sequence",
+      "group": {
+        "kind": "build"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "close": true
+      }
+    },
+    {
+      "label": "Build AAB",
+      "type": "shell",
+      "command": "gh",
+      "args": ["workflow", "run", "android-production-release.yml"],
+      "dependsOrder": "sequence",
+      "group": {
+        "kind": "build"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "close": true
+      }
+    },
+    {
+      "label": "Build APK",
+      "type": "shell",
+      "command": "gh",
+      "args": ["workflow", "run", "android-preview-release.yml"],
+      "dependsOrder": "sequence",
+      "group": {
+        "kind": "build"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "close": true
+      }
+    },
+    {
+      "label": "Start Expo",
+      "type": "shell",
+      "command": "bunx",
+      "args": ["expo", "start"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "close": false
+      }
+    },
+    {
+      "label": "Bump Version (Build minor+patch)",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "bun x npm version minor --no-git-tag-version; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; bun x npm version patch --no-git-tag-version"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "never",
+        "panel": "new",
+        "close": true
+      }
+    },
+    {
+      "label": "build + submit",
+      "type": "shell",
+      "command": "eas",
+      "args": [
+        "build",
+        "--platform",
+        "android",
+        "--profile",
+        "production",
+        "--auto-submit"
+      ],
+      "dependsOn": ["Bump Version (Build minor+patch)"],
+      "dependsOrder": "sequence",
+      "group": {
+        "kind": "build"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "close": true
+      }
+    },
+    {
+      "label": "Start Landing Dev",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-Command",
+        "Start-Process http://localhost:3000; bun run dev"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}\\bunkialo-landing"
+      },
+      "group": {
+        "kind": "build"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "close": false
+      }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "updateMessage",
+      "type": "promptString",
+      "description": "Enter the update message",
+      "default": "changes"
+    }
+  ]
+}
