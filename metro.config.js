@@ -9,6 +9,36 @@ const config = getDefaultConfig(__dirname);
 // Fix for Zustand import.meta crash on Expo Web
 config.resolver.unstable_enablePackageExports = false;
 
+const originalResolveRequest = config.resolver.resolveRequest;
+config.resolver.resolveRequest = (context, moduleName, platform) => {
+  if (moduleName === "axios") {
+    return {
+      type: "sourceFile",
+      filePath: require.resolve("axios/dist/browser/axios.cjs"),
+    };
+  }
+  if (
+    moduleName === "crypto" ||
+    moduleName === "node:crypto" ||
+    moduleName === "http" ||
+    moduleName === "node:http" ||
+    moduleName === "https" ||
+    moduleName === "node:https" ||
+    moduleName === "url" ||
+    moduleName === "node:url" ||
+    moduleName === "zlib" ||
+    moduleName === "node:zlib"
+  ) {
+    return {
+      type: "empty",
+    };
+  }
+  if (originalResolveRequest) {
+    return originalResolveRequest(context, moduleName, platform);
+  }
+  return context.resolveRequest(context, moduleName, platform);
+};
+
 function makeProxyRequest(
   targetUrlStr,
   method,
