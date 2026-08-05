@@ -19,7 +19,7 @@ export default ({ config }: { config: ExpoConfig }): ExpoConfig => {
   return {
     ...config,
     name: "Bunkialo2",
-    slug: "Bunkialo2",
+    slug: "divy",
     orientation: "portrait",
     icon: "./src/assets/images/icon.png",
     scheme: "bunkialo",
