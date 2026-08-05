@@ -1,0 +1,413 @@
+import { ConfirmModal } from "@/components/modals/confirm-modal";
+import { SlotConflictModal } from "@/components/modals/slot-conflict-modal";
+import { Colors } from "@/constants/theme";
+import { useBunkActions } from "@/hooks/use-bunk-actions";
+import { useColorScheme } from "@/hooks/use-color-scheme";
+import { useCourseActions } from "@/hooks/use-course-actions";
+import { useAttendanceStore } from "@/stores/attendance-store";
+import { useAttendanceUIStore } from "@/stores/attendance-ui-store";
+import {
+  filterPastBunks,
+  getDisplayName,
+  selectAllDutyLeaves,
+  useBunkStore,
+} from "@/stores/bunk-store";
+import type { CourseAttendance, CourseBunkData } from "@/types";
+import {
+  filterCompletedAttendanceRecords,
+  getRecordKeyVariants,
+} from "@/utils/attendance-helpers";
+import { useCallback, useMemo } from "react";
+import {
+  ActivityIndicator,
+  FlatList,
+  RefreshControl,
+  Text,
+  View,
+} from "react-native";
+import { AddBunkModal } from "../add-bunk-modal";
+import { ChangesModal } from "../changes-modal";
+import { CourseEditModal } from "../course-edit-modal";
+import { CreateCourseModal } from "../create-course-modal";
+import { DLInputModal } from "../dl-input-modal";
+import { DutyLeaveModal } from "../duty-leave-modal";
+import { PresenceInputModal } from "../presence-input-modal";
+import { UnifiedCourseCard } from "../unified-course-card";
+import { UnknownStatusModal } from "../unknown-status-modal";
+
+const getEffectiveCoursePercentage = (
+  course: CourseAttendance | null,
+  bunkData: CourseBunkData | undefined,
+): number => {
+  if (!course) return Number.POSITIVE_INFINITY;
+
+  const pastRecords = filterCompletedAttendanceRecords(course.records);
+  const totalSessions = pastRecords.length;
+  if (totalSessions === 0) return 0;
+
+  const bunkKeys = new Set<string>();
+  if (bunkData) {
+    for (const bunk of bunkData.bunks) {
+      for (const key of getRecordKeyVariants(bunk)) {
+        bunkKeys.add(key);
+      }
+    }
+  }
+
+  const displayRecords = pastRecords.filter(
+    (record) =>
+      record.status !== "Unknown" ||
+      !getRecordKeyVariants(record).some((key) => bunkKeys.has(key)),
+  );
+  const confirmedPresentCount = pastRecords.filter(
+    (record) => record.status === "Present",
+  ).length;
+  const unknownCount = displayRecords.filter(
+    (record) => record.status === "Unknown",
+  ).length;
+  const correctedPresentCount = bunkData
+    ? filterPastBunks(bunkData.bunks).filter((bunk) => bunk.isMarkedPresent)
+        .length
+    : 0;
+  const attended = confirmedPresentCount + unknownCount + correctedPresentCount;
+
+  return Math.round((attended / totalSessions) * 100);
+};
+
+export const CoursesContent = () => {
+  const colorScheme = useColorScheme();
+  const isDark = colorScheme === "dark";
+  const theme = isDark ? Colors.dark : Colors.light;
+
+  const { courses, isLoading, lastSyncTime, fetchAttendance } =
+    useAttendanceStore();
+  const { courses: bunkCourses, hiddenCourses } = useBunkStore();
+  const { activeModal, isEditMode, openModal, closeModal } =
+    useAttendanceUIStore();
+
+  const {
+    handleMarkDLCourses,
+    handleConfirmDLCourses,
+    handleMarkPresentCourses,
+    handleConfirmPresenceCourses,
+    handleConfirmRemoveDL,
+    handleConfirmRemovePresent,
+    handleConfirmUnknownAbsent,
+    handleRevertUnknown,
+    applyUnknownPresent,
+    applyUnknownAbsent,
+    updateBunkNote,
+  } = useBunkActions();
+
+  const {
+    handleSaveCourse,
+    handleAddBunk,
+    handleCreateCourse,
+    handleDeleteCourse,
+    handleResolveConflict,
+    handleResolveAllPreferred,
+    conflicts,
+    handleRevertConflict,
+  } = useCourseActions();
+
+  const visibleAttendanceCourses = useMemo(
+    () => courses.filter((course) => !hiddenCourses[course.courseId]),
+    [courses, hiddenCourses],
+  );
+
+  const visibleBunkCourses = useMemo(
+    () =>
+      bunkCourses.filter(
+        (course) => course.isCustomCourse || !hiddenCourses[course.courseId],
+      ),
+    [bunkCourses, hiddenCourses],
+  );
+
+  const allDutyLeaves = useMemo(
+    () => selectAllDutyLeaves(visibleBunkCourses),
+    [visibleBunkCourses],
+  );
+
+  // combine LMS courses with custom courses
+  const allCourses = useMemo(() => {
+    const lmsCourseData = visibleAttendanceCourses.map((course) => ({
+      type: "lms" as const,
+      course,
+      bunkData: visibleBunkCourses.find((c) => c.courseId === course.courseId),
+    }));
+    const customCourseData = visibleBunkCourses
+      .filter((c) => c.isCustomCourse)
+      .map((bunkData) => ({
+        type: "custom" as const,
+        course: null,
+        bunkData,
+      }));
+
+    return [...lmsCourseData, ...customCourseData].sort((a, b) => {
+      const aPercentage = getEffectiveCoursePercentage(a.course, a.bunkData);
+      const bPercentage = getEffectiveCoursePercentage(b.course, b.bunkData);
+
+      if (aPercentage !== bPercentage) {
+        return aPercentage - bPercentage;
+      }
+
+      const aName =
+        a.bunkData?.config?.alias ??
+        a.course?.courseName ??
+        a.bunkData?.courseId ??
+        "";
+      const bName =
+        b.bunkData?.config?.alias ??
+        b.course?.courseName ??
+        b.bunkData?.courseId ??
+        "";
+
+      return aName.localeCompare(bName);
+    });
+  }, [visibleAttendanceCourses, visibleBunkCourses]);
+
+  const handleRefresh = useCallback(() => {
+    fetchAttendance();
+  }, [fetchAttendance]);
+
+  // modal visibility checks
+  const isCourseEditVisible = activeModal?.type === "course-edit";
+  const isAddBunkVisible = activeModal?.type === "add-bunk";
+  const isCreateCourseVisible = activeModal?.type === "create-course";
+  const isChangesVisible = activeModal?.type === "changes";
+  const isDLInputBunkVisible = activeModal?.type === "dl-input-bunk";
+  const isPresenceInputBunkVisible =
+    activeModal?.type === "presence-input-bunk";
+  const isDutyLeaveListVisible = activeModal?.type === "duty-leave-list";
+  const isUnknownStatusVisible = activeModal?.type === "unknown-status";
+  const isSlotConflictVisible = activeModal?.type === "slot-conflict";
+  const isConfirmVisible =
+    activeModal?.type === "confirm-remove-dl" ||
+    activeModal?.type === "confirm-remove-present" ||
+    activeModal?.type === "confirm-unknown-absent";
+
+  const getConfirmContent = () => {
+    if (!activeModal) return { title: "", message: "", confirmText: "" };
+    switch (activeModal.type) {
+      case "confirm-remove-dl":
+        return {
+          title: "Remove Duty Leave",
+          message: "This will count as a regular bunk again.",
+          confirmText: "Remove",
+        };
+      case "confirm-remove-present":
+        return {
+          title: "Remove Presence Mark",
+          message: "This will count as an absence again.",
+          confirmText: "Remove",
+        };
+      case "confirm-unknown-absent":
+        return {
+          title: "Confirm Absent",
+          message: "This will add a bunk for this session.",
+          confirmText: "Confirm",
+        };
+      default:
+        return { title: "", message: "", confirmText: "" };
+    }
+  };
+
+  const confirmContent = getConfirmContent();
+
+  const renderEmpty = () => {
+    if (isLoading) {
+      return (
+        <View className="items-center gap-4 py-12">
+          <ActivityIndicator size="large" color={theme.text} />
+          <Text className="text-[14px]" style={{ color: theme.textSecondary }}>
+            Fetching attendance data...
+          </Text>
+        </View>
+      );
+    }
+    return (
+      <View className="items-center gap-4 py-12">
+        <Text className="text-[14px]" style={{ color: theme.textSecondary }}>
+          No courses found. Pull to refresh.
+        </Text>
+      </View>
+    );
+  };
+
+  const renderFooter = () => {
+    if (!lastSyncTime || visibleAttendanceCourses.length === 0) return null;
+    return <View className="h-6" />;
+  };
+
+  return (
+    <>
+      <FlatList
+        data={allCourses}
+        keyExtractor={(item) =>
+          item.bunkData?.courseId || item.course?.courseId || ""
+        }
+        renderItem={({ item }) => {
+          const { course, bunkData } = item;
+          const courseId = bunkData?.courseId || course?.courseId || "";
+          return (
+            <UnifiedCourseCard
+              course={course}
+              bunkData={bunkData}
+              isEditMode={isEditMode}
+              onEdit={() => {
+                if (bunkData)
+                  openModal({ type: "course-edit", course: bunkData });
+              }}
+              onAddBunk={() => {
+                if (bunkData) openModal({ type: "add-bunk", course: bunkData });
+              }}
+              onMarkDL={(bunkId) => handleMarkDLCourses(courseId, bunkId)}
+              onRemoveDL={(bunkId) =>
+                openModal({ type: "confirm-remove-dl", courseId, bunkId })
+              }
+              onMarkPresent={(bunkId) =>
+                handleMarkPresentCourses(courseId, bunkId)
+              }
+              onRemovePresent={(bunkId) =>
+                openModal({ type: "confirm-remove-present", courseId, bunkId })
+              }
+              onUpdateNote={(bunkId, note) =>
+                updateBunkNote(courseId, bunkId, note)
+              }
+              onShowUnknown={() => openModal({ type: "unknown-status" })}
+              onDeleteCustomCourse={() => {
+                if (bunkData?.isCustomCourse) {
+                  handleDeleteCourse(courseId);
+                }
+              }}
+            />
+          );
+        }}
+        ListFooterComponent={renderFooter}
+        ListEmptyComponent={renderEmpty}
+        contentContainerClassName="p-4 pb-[100px]"
+        ItemSeparatorComponent={() => <View className="h-4" />}
+        refreshControl={
+          <RefreshControl
+            refreshing={isLoading}
+            onRefresh={handleRefresh}
+            tintColor={theme.text}
+          />
+        }
+      />
+
+      <CourseEditModal
+        visible={isCourseEditVisible}
+        course={activeModal?.type === "course-edit" ? activeModal.course : null}
+        onClose={closeModal}
+        onSave={handleSaveCourse}
+        onDelete={(course) => handleDeleteCourse(course.courseId)}
+      />
+
+      <AddBunkModal
+        visible={isAddBunkVisible}
+        courseName={
+          activeModal?.type === "add-bunk"
+            ? getDisplayName(activeModal.course)
+            : ""
+        }
+        onClose={closeModal}
+        onAdd={(date, timeSlot, note) => {
+          if (activeModal?.type === "add-bunk") {
+            handleAddBunk(activeModal.course, date, timeSlot, note);
+          }
+        }}
+      />
+
+      <CreateCourseModal
+        visible={isCreateCourseVisible}
+        onClose={closeModal}
+        onSave={handleCreateCourse}
+      />
+
+      <ChangesModal visible={isChangesVisible} onClose={closeModal} />
+
+      <DLInputModal
+        visible={isDLInputBunkVisible}
+        onClose={closeModal}
+        onConfirm={(note) => {
+          if (activeModal?.type === "dl-input-bunk") {
+            handleConfirmDLCourses(note, {
+              courseId: activeModal.courseId,
+              bunkId: activeModal.bunkId,
+            });
+          }
+        }}
+      />
+
+      <PresenceInputModal
+        visible={isPresenceInputBunkVisible}
+        onClose={closeModal}
+        onConfirm={(note) => {
+          if (activeModal?.type === "presence-input-bunk") {
+            handleConfirmPresenceCourses(note, {
+              courseId: activeModal.courseId,
+              bunkId: activeModal.bunkId,
+            });
+          }
+        }}
+      />
+
+      <DutyLeaveModal
+        visible={isDutyLeaveListVisible}
+        dutyLeaves={allDutyLeaves}
+        onClose={closeModal}
+        onRemove={(courseId, bunkId) =>
+          openModal({ type: "confirm-remove-dl", courseId, bunkId })
+        }
+      />
+
+      <UnknownStatusModal
+        visible={isUnknownStatusVisible}
+        courses={visibleAttendanceCourses}
+        bunkCourses={visibleBunkCourses}
+        onClose={closeModal}
+        onRevert={handleRevertUnknown}
+        onConfirmPresent={applyUnknownPresent}
+        onConfirmAbsent={(courseId, record) => {
+          applyUnknownAbsent(courseId, record);
+        }}
+      />
+
+      <SlotConflictModal
+        visible={isSlotConflictVisible && conflicts.length > 0}
+        conflicts={conflicts}
+        onResolve={handleResolveConflict}
+        onResolveAllPreferred={handleResolveAllPreferred}
+        onRevertConflict={handleRevertConflict}
+        onClose={closeModal}
+      />
+
+      <ConfirmModal
+        visible={isConfirmVisible}
+        title={confirmContent.title}
+        message={confirmContent.message}
+        confirmText={confirmContent.confirmText}
+        variant="destructive"
+        icon="warning"
+        onCancel={closeModal}
+        onConfirm={() => {
+          if (!activeModal) return;
+          if (activeModal.type === "confirm-remove-dl") {
+            handleConfirmRemoveDL(activeModal.courseId, activeModal.bunkId);
+          } else if (activeModal.type === "confirm-remove-present") {
+            handleConfirmRemovePresent(
+              activeModal.courseId,
+              activeModal.bunkId,
+            );
+          } else if (activeModal.type === "confirm-unknown-absent") {
+            handleConfirmUnknownAbsent(
+              activeModal.courseId,
+              activeModal.record,
+            );
+          }
+        }}
+      />
+    </>
+  );
+};

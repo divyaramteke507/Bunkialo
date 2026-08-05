@@ -1,0 +1,786 @@
+import { Colors } from "@/constants/theme";
+import { findCreditsByCode } from "@/data/credits";
+import type {
+  CourseAttendanceSnapshot,
+  BunkRecord,
+  CourseBunkStats,
+  BunkState,
+  CourseBunkData,
+  CourseConfig,
+  CustomCourseInput,
+  DutyLeaveInfo,
+  HiddenCourseReason,
+  ManualSlot,
+  ManualSlotInput,
+} from "@/types";
+import { getRandomCourseColor } from "@/utils/course-color";
+import { extractCourseCode, extractCourseName } from "@/utils/course-name";
+import {
+  getCanonicalRecordDescription,
+  getRecordKeyVariants,
+  recordsReferToSameSession,
+} from "@/utils/attendance-helpers";
+import { evaluateCoursesAgainstCurrentSemester } from "@/utils/semester-course-filter";
+import { create } from "zustand";
+import { createJSONStorage, persist } from "zustand/middleware";
+import { useAttendanceStore } from "./attendance-store";
+import { zustandStorage } from "./storage";
+
+interface BunkStoreState extends BunkState {
+  hasHydrated: boolean;
+}
+
+interface BunkActions {
+  syncFromLms: () => void;
+  resetToLms: () => void;
+  clearBunks: () => void;
+  updateCourseConfig: (courseId: string, config: CourseConfig) => void;
+  addBunk: (courseId: string, bunk: Omit<BunkRecord, "id" | "source">) => void;
+  updateBunkNote: (courseId: string, bunkId: string, note: string) => void;
+  markAsDutyLeave: (courseId: string, bunkId: string, note: string) => void;
+  removeDutyLeave: (courseId: string, bunkId: string) => void;
+  markAsPresent: (courseId: string, bunkId: string, note: string) => void;
+  removePresenceCorrection: (courseId: string, bunkId: string) => void;
+  removeBunk: (courseId: string, bunkId: string) => void;
+  setHasHydrated: (hasHydrated: boolean) => void;
+  addCustomCourse: (input: CustomCourseInput) => string;
+  hideCourse: (
+    courseId: string,
+    courseName: string,
+    reason: HiddenCourseReason,
+    semesterKey?: string,
+  ) => void;
+  restoreCourse: (
+    courseId: string,
+    options?: { keepVisibleForSemesterKey?: string },
+  ) => void;
+  deleteCourse: (courseId: string) => void;
+  deleteCustomCourse: (courseId: string) => void;
+  addManualSlot: (courseId: string, slot: ManualSlotInput) => string | null;
+  setManualSlots: (courseId: string, slots: ManualSlotInput[]) => void;
+  updateManualSlot: (
+    courseId: string,
+    slotId: string,
+    slot: ManualSlotInput,
+  ) => void;
+  removeManualSlot: (courseId: string, slotId: string) => void;
+}
+
+const generateId = () =>
+  `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+
+// parse date string to extract time slot
+const parseTimeSlot = (dateStr: string): string | null => {
+  const timeMatch = dateStr.match(
+    /(\d{1,2}(?::\d{2})?(?:AM|PM)\s*-\s*\d{1,2}(?::\d{2})?(?:AM|PM))/i,
+  );
+  return timeMatch ? timeMatch[1] : null;
+};
+
+// parse "Thu 1 Jan 2026 11AM - 12PM" -> "2026-01-01"
+const parseDateString = (dateStr: string): string | null => {
+  const dateMatch = dateStr.match(/(\d{1,2})\s+(\w{3})\s+(\d{4})/);
+  if (!dateMatch) return null;
+
+  const [, day, monthStr, year] = dateMatch;
+  const months: Record<string, string> = {
+    jan: "01",
+    feb: "02",
+    mar: "03",
+    apr: "04",
+    may: "05",
+    jun: "06",
+    jul: "07",
+    aug: "08",
+    sep: "09",
+    oct: "10",
+    nov: "11",
+    dec: "12",
+  };
+  const month = months[monthStr.toLowerCase()];
+  if (!month) return null;
+
+  return `${year}-${month}-${day.padStart(2, "0")}`;
+};
+
+const parseTimeToMinutes = (timeStr: string): number | null => {
+  const match = timeStr.trim().match(/^(\d{1,2})(?::(\d{2}))?(AM|PM)$/i);
+  if (!match) return null;
+
+  const [, hourStr, minuteStr, meridiem] = match;
+  const hour12 = parseInt(hourStr, 10);
+  const minutes = minuteStr ? parseInt(minuteStr, 10) : 0;
+  if (hour12 < 1 || hour12 > 12 || minutes < 0 || minutes > 59) return null;
+
+  let hour24 = hour12 % 12;
+  if (meridiem.toUpperCase() === "PM") hour24 += 12;
+  return hour24 * 60 + minutes;
+};
+
+const getSessionEndDateTime = (
+  date: string,
+  timeSlot: string | null,
+): Date | null => {
+  const baseDate = new Date(`${date}T00:00:00`);
+  if (Number.isNaN(baseDate.getTime())) return null;
+  if (!timeSlot) return baseDate;
+
+  const [, endPartRaw] = timeSlot.split("-").map((part) => part.trim());
+  if (!endPartRaw) return baseDate;
+
+  const endMinutes = parseTimeToMinutes(endPartRaw);
+  if (endMinutes === null) return baseDate;
+
+  const endDate = new Date(baseDate);
+  endDate.setHours(Math.floor(endMinutes / 60), endMinutes % 60, 0, 0);
+  return endDate;
+};
+
+// check if session end time is in the past (or exactly now)
+const isPastOrCompleted = (dateStr: string): boolean => {
+  const parsed = parseDateString(dateStr);
+  if (!parsed) return false;
+  const timeSlot = parseTimeSlot(dateStr);
+  const sessionEnd = getSessionEndDateTime(parsed, timeSlot);
+  if (!sessionEnd) return false;
+  const now = new Date();
+  return sessionEnd <= now;
+};
+
+// filter bunks to completed sessions only
+export const filterPastBunks = (bunks: BunkRecord[]): BunkRecord[] => {
+  return bunks.filter((b) => isPastOrCompleted(b.date));
+};
+
+export const useBunkStore = create<BunkStoreState & BunkActions>()(
+  persist(
+    (set, get) => ({
+      courses: [],
+      hiddenCourses: {},
+      autoDropOptOutBySemester: {},
+      lastSyncTime: null,
+      isLoading: false,
+      error: null,
+      hasHydrated: false,
+
+      setHasHydrated: (hasHydrated) => set({ hasHydrated }),
+
+      // sync absences from attendance store (LMS data)
+      syncFromLms: () => {
+        const attendanceCourses = useAttendanceStore.getState().courses;
+        const {
+          courses: currentBunks,
+          hiddenCourses: currentHiddenCourses,
+          autoDropOptOutBySemester,
+        } = get();
+        const { semesterWindow, byCourseId } =
+          evaluateCoursesAgainstCurrentSemester(attendanceCourses);
+        const now = Date.now();
+        const attendanceCourseNameById = new Map(
+          attendanceCourses.map((course) => [course.courseId, course.courseName]),
+        );
+
+        const autoDroppedCourseIds = new Set<string>();
+        for (const course of attendanceCourses) {
+          const decision = byCourseId[course.courseId];
+          const optedOutForCurrentSemester =
+            autoDropOptOutBySemester[course.courseId] ===
+            semesterWindow.semesterKey;
+          if (decision?.shouldAutoDrop && !optedOutForCurrentSemester) {
+            autoDroppedCourseIds.add(course.courseId);
+          }
+        }
+
+        const updatedCourses: CourseBunkData[] = attendanceCourses.map(
+          (course) => {
+            const existing = currentBunks.find(
+              (c) => c.courseId === course.courseId,
+            );
+
+            // get absences from LMS
+            const lmsBunks: BunkRecord[] = course.records
+              .filter((r) => r.status === "Absent")
+              .map((r) => ({
+                id: generateId(),
+                date: r.date,
+                description: getCanonicalRecordDescription(r),
+                timeSlot: parseTimeSlot(r.date),
+                note: "",
+                source: "lms" as const,
+                isDutyLeave: false,
+                dutyLeaveNote: "",
+                isMarkedPresent: false,
+                presenceNote: "",
+              }));
+
+            if (existing) {
+              // merge: keep user bunks, update LMS bunks, preserve notes/DL status
+              const lmsKeys = new Set<string>();
+              for (const bunk of lmsBunks) {
+                for (const key of getRecordKeyVariants(bunk)) {
+                  lmsKeys.add(key);
+                }
+              }
+              const userBunks = existing.bunks.filter(
+                (b) => {
+                  if (b.source !== "user") return false;
+                  return !getRecordKeyVariants(b).some((key) =>
+                    lmsKeys.has(key),
+                  );
+                },
+              );
+
+              const mergedLmsBunks = lmsBunks.map((newBunk) => {
+                // find matching existing bunk by date+description
+                const oldBunk =
+                  existing.bunks.find(
+                    (b) =>
+                      b.source === "lms" &&
+                      recordsReferToSameSession(b, newBunk),
+                  ) ||
+                  existing.bunks.find(
+                    (b) =>
+                      b.source === "user" &&
+                      recordsReferToSameSession(b, newBunk),
+                  );
+                if (oldBunk) {
+                  return {
+                    ...newBunk,
+                    id: oldBunk.id,
+                    note: oldBunk.note,
+                    isDutyLeave: oldBunk.isDutyLeave,
+                    dutyLeaveNote: oldBunk.dutyLeaveNote,
+                    isMarkedPresent: oldBunk.isMarkedPresent,
+                    presenceNote: oldBunk.presenceNote,
+                  };
+                }
+                return newBunk;
+              });
+
+              // always update config with extracted name/code
+              const extractedName = extractCourseName(course.courseName);
+              const extractedCode = extractCourseCode(course.courseName);
+              const autoCredits = findCreditsByCode(extractedCode);
+              const updatedConfig: CourseConfig = existing.config
+                ? {
+                    ...existing.config,
+                    alias: extractedName,
+                    courseCode: extractedCode,
+                    overrideLmsSlots: existing.config.overrideLmsSlots ?? false,
+                  }
+                : {
+                    credits: autoCredits ?? 3,
+                    alias: extractedName,
+                    courseCode: extractedCode,
+                    color: getRandomCourseColor(),
+                    overrideLmsSlots: false,
+                  };
+
+              return {
+                courseId: course.courseId,
+                courseName: course.courseName,
+                config: updatedConfig,
+                bunks: [...mergedLmsBunks, ...userBunks],
+                isConfigured: existing.isConfigured || autoCredits !== null,
+                isCustomCourse: false,
+                manualSlots: existing.manualSlots || [],
+              };
+            }
+
+            // auto-assign color for new courses based on index
+            const courseIndex = attendanceCourses.findIndex(
+              (c) => c.courseId === course.courseId,
+            );
+            const autoColor =
+              Colors.courseColors[courseIndex % Colors.courseColors.length];
+            const extractedName = extractCourseName(course.courseName);
+            const extractedCode = extractCourseCode(course.courseName);
+            const autoCredits = findCreditsByCode(extractedCode);
+
+            return {
+              courseId: course.courseId,
+              courseName: course.courseName,
+              config: {
+                credits: autoCredits ?? 3,
+                alias: extractedName,
+                courseCode: extractedCode,
+                color: autoColor,
+                overrideLmsSlots: false,
+              },
+              bunks: lmsBunks,
+              isConfigured: autoCredits !== null,
+              isCustomCourse: false,
+              manualSlots: [],
+            };
+          },
+        );
+
+        // preserve custom courses (not from LMS)
+        const customCourses = currentBunks.filter((c) => c.isCustomCourse);
+        const nextHiddenCourses = { ...currentHiddenCourses };
+
+        for (const [courseId, hiddenCourse] of Object.entries(nextHiddenCourses)) {
+          if (hiddenCourse.reason !== "auto-semester") continue;
+          if (
+            hiddenCourse.semesterKey !== semesterWindow.semesterKey ||
+            !autoDroppedCourseIds.has(courseId)
+          ) {
+            delete nextHiddenCourses[courseId];
+          }
+        }
+
+        for (const courseId of autoDroppedCourseIds) {
+          const existingHidden = nextHiddenCourses[courseId];
+          if (existingHidden?.reason === "manual") continue;
+          const courseName =
+            attendanceCourseNameById.get(courseId) ?? existingHidden?.courseName;
+          if (!courseName) continue;
+          nextHiddenCourses[courseId] = {
+            courseId,
+            courseName,
+            reason: "auto-semester",
+            hiddenAt: now,
+            semesterKey: semesterWindow.semesterKey,
+          };
+        }
+
+        set({
+          courses: [...updatedCourses, ...customCourses],
+          hiddenCourses: nextHiddenCourses,
+          lastSyncTime: Date.now(),
+        });
+      },
+
+      // reset all to LMS data, wipe user modifications (but keep custom courses)
+      resetToLms: () => {
+        const attendanceCourses = useAttendanceStore.getState().courses;
+        const currentBunks = get().courses;
+
+        const freshCourses: CourseBunkData[] = attendanceCourses.map(
+          (course) => {
+            const existing = currentBunks.find(
+              (c) => c.courseId === course.courseId,
+            );
+            const lmsBunks: BunkRecord[] = course.records
+              .filter((r) => r.status === "Absent")
+              .map((r) => ({
+                id: generateId(),
+                date: r.date,
+                description: getCanonicalRecordDescription(r),
+                timeSlot: parseTimeSlot(r.date),
+                note: "",
+                source: "lms" as const,
+                isDutyLeave: false,
+                dutyLeaveNote: "",
+                isMarkedPresent: false,
+                presenceNote: "",
+              }));
+
+            // auto-assign color based on index
+            const courseIndex = attendanceCourses.findIndex(
+              (c) => c.courseId === course.courseId,
+            );
+            const autoColor =
+              Colors.courseColors[courseIndex % Colors.courseColors.length];
+            const extractedName = extractCourseName(course.courseName);
+            const extractedCode = extractCourseCode(course.courseName);
+            const autoCredits = findCreditsByCode(extractedCode);
+
+            return {
+              courseId: course.courseId,
+              courseName: course.courseName,
+              config: {
+                credits: autoCredits ?? 3,
+                alias: extractedName,
+                courseCode: extractedCode,
+                color: autoColor,
+                overrideLmsSlots: existing?.config?.overrideLmsSlots ?? false,
+              },
+              bunks: lmsBunks,
+              isConfigured: autoCredits !== null,
+              isCustomCourse: false,
+              manualSlots: existing?.manualSlots || [],
+            };
+          },
+        );
+
+        // preserve custom courses
+        const customCourses = currentBunks.filter((c) => c.isCustomCourse);
+        set({
+          courses: [...freshCourses, ...customCourses],
+          hiddenCourses: {},
+          autoDropOptOutBySemester: {},
+          lastSyncTime: Date.now(),
+        });
+      },
+
+      clearBunks: () => {
+        set({
+          courses: [],
+          hiddenCourses: {},
+          autoDropOptOutBySemester: {},
+          lastSyncTime: null,
+          isLoading: false,
+          error: null,
+        });
+      },
+
+      updateCourseConfig: (courseId, config) => {
+        set((state) => ({
+          courses: state.courses.map((c) =>
+            c.courseId === courseId ? { ...c, config, isConfigured: true } : c,
+          ),
+        }));
+      },
+
+      addBunk: (courseId, bunk) => {
+        const newBunk: BunkRecord = {
+          ...bunk,
+          id: generateId(),
+          source: "user",
+        };
+        set((state) => ({
+          courses: state.courses.map((c) =>
+            c.courseId === courseId
+              ? { ...c, bunks: [...c.bunks, newBunk] }
+              : c,
+          ),
+        }));
+      },
+
+      updateBunkNote: (courseId, bunkId, note) => {
+        set((state) => ({
+          courses: state.courses.map((c) =>
+            c.courseId === courseId
+              ? {
+                  ...c,
+                  bunks: c.bunks.map((b) =>
+                    b.id === bunkId ? { ...b, note } : b,
+                  ),
+                }
+              : c,
+          ),
+        }));
+      },
+
+      markAsDutyLeave: (courseId, bunkId, note) => {
+        set((state) => ({
+          courses: state.courses.map((c) =>
+            c.courseId === courseId
+              ? {
+                  ...c,
+                  bunks: c.bunks.map((b) =>
+                    b.id === bunkId
+                      ? { ...b, isDutyLeave: true, dutyLeaveNote: note }
+                      : b,
+                  ),
+                }
+              : c,
+          ),
+        }));
+      },
+
+      removeDutyLeave: (courseId, bunkId) => {
+        set((state) => ({
+          courses: state.courses.map((c) =>
+            c.courseId === courseId
+              ? {
+                  ...c,
+                  bunks: c.bunks.map((b) =>
+                    b.id === bunkId
+                      ? { ...b, isDutyLeave: false, dutyLeaveNote: "" }
+                      : b,
+                  ),
+                }
+              : c,
+          ),
+        }));
+      },
+
+      markAsPresent: (courseId, bunkId, note) => {
+        set((state) => ({
+          courses: state.courses.map((c) =>
+            c.courseId === courseId
+              ? {
+                  ...c,
+                  bunks: c.bunks.map((b) =>
+                    b.id === bunkId
+                      ? { ...b, isMarkedPresent: true, presenceNote: note }
+                      : b,
+                  ),
+                }
+              : c,
+          ),
+        }));
+      },
+
+      removePresenceCorrection: (courseId, bunkId) => {
+        set((state) => ({
+          courses: state.courses.map((c) =>
+            c.courseId === courseId
+              ? {
+                  ...c,
+                  bunks: c.bunks.map((b) =>
+                    b.id === bunkId
+                      ? { ...b, isMarkedPresent: false, presenceNote: "" }
+                      : b,
+                  ),
+                }
+              : c,
+          ),
+        }));
+      },
+
+      removeBunk: (courseId, bunkId) => {
+        set((state) => ({
+          courses: state.courses.map((c) =>
+            c.courseId === courseId
+              ? { ...c, bunks: c.bunks.filter((b) => b.id !== bunkId) }
+              : c,
+          ),
+        }));
+      },
+
+      addCustomCourse: (input) => {
+        const courseId = `custom-${generateId()}`;
+        const manualSlots: ManualSlot[] = input.slots.map((slot) => ({
+          ...slot,
+          id: generateId(),
+        }));
+
+        const newCourse: CourseBunkData = {
+          courseId,
+          courseName: input.courseName,
+          config: {
+            credits: input.credits,
+            alias: input.alias || input.courseName,
+            courseCode: "",
+            color: input.color,
+            overrideLmsSlots: true,
+          },
+          bunks: [],
+          isConfigured: true,
+          isCustomCourse: true,
+          manualSlots,
+        };
+
+        set((state) => ({
+          courses: [...state.courses, newCourse],
+        }));
+
+        return courseId;
+      },
+
+      hideCourse: (courseId, courseName, reason, semesterKey) => {
+        set((state) => ({
+          hiddenCourses: {
+            ...state.hiddenCourses,
+            [courseId]: {
+              courseId,
+              courseName,
+              reason,
+              hiddenAt: Date.now(),
+              semesterKey: semesterKey ?? null,
+            },
+          },
+        }));
+      },
+
+      restoreCourse: (courseId, options) => {
+        set((state) => {
+          const nextHiddenCourses = { ...state.hiddenCourses };
+          const nextOptOutBySemester = { ...state.autoDropOptOutBySemester };
+          delete nextHiddenCourses[courseId];
+
+          if (options?.keepVisibleForSemesterKey) {
+            nextOptOutBySemester[courseId] = options.keepVisibleForSemesterKey;
+          } else {
+            delete nextOptOutBySemester[courseId];
+          }
+
+          return {
+            hiddenCourses: nextHiddenCourses,
+            autoDropOptOutBySemester: nextOptOutBySemester,
+          };
+        });
+      },
+
+      deleteCourse: (courseId) => {
+        set((state) => {
+          const course = state.courses.find((c) => c.courseId === courseId);
+          if (!course) return state;
+
+          const nextHiddenCourses = { ...state.hiddenCourses };
+          const nextOptOutBySemester = { ...state.autoDropOptOutBySemester };
+
+          if (course.isCustomCourse) {
+            delete nextHiddenCourses[courseId];
+            delete nextOptOutBySemester[courseId];
+            return {
+              courses: state.courses.filter((c) => c.courseId !== courseId),
+              hiddenCourses: nextHiddenCourses,
+              autoDropOptOutBySemester: nextOptOutBySemester,
+            };
+          }
+
+          delete nextOptOutBySemester[courseId];
+          nextHiddenCourses[courseId] = {
+            courseId,
+            courseName: course.courseName,
+            reason: "manual",
+            hiddenAt: Date.now(),
+            semesterKey: null,
+          };
+
+          return {
+            hiddenCourses: nextHiddenCourses,
+            autoDropOptOutBySemester: nextOptOutBySemester,
+          };
+        });
+      },
+
+      deleteCustomCourse: (courseId) => {
+        get().deleteCourse(courseId);
+      },
+
+      addManualSlot: (courseId, slot) => {
+        const slotId = generateId();
+        const newSlot: ManualSlot = {
+          ...slot,
+          id: slotId,
+        };
+
+        const course = get().courses.find((c) => c.courseId === courseId);
+        if (!course) return null;
+
+        set((state) => ({
+          courses: state.courses.map((c) =>
+            c.courseId === courseId
+              ? { ...c, manualSlots: [...c.manualSlots, newSlot] }
+              : c,
+          ),
+        }));
+
+        return slotId;
+      },
+
+      setManualSlots: (courseId, slots) => {
+        const manualSlots: ManualSlot[] = slots.map((slot) => ({
+          ...slot,
+          id: generateId(),
+        }));
+
+        set((state) => ({
+          courses: state.courses.map((c) =>
+            c.courseId === courseId ? { ...c, manualSlots } : c,
+          ),
+        }));
+      },
+
+      updateManualSlot: (courseId, slotId, slot) => {
+        set((state) => ({
+          courses: state.courses.map((c) =>
+            c.courseId === courseId
+              ? {
+                  ...c,
+                  manualSlots: c.manualSlots.map((s) =>
+                    s.id === slotId ? { ...s, ...slot } : s,
+                  ),
+                }
+              : c,
+          ),
+        }));
+      },
+
+      removeManualSlot: (courseId, slotId) => {
+        set((state) => ({
+          courses: state.courses.map((c) =>
+            c.courseId === courseId
+              ? {
+                  ...c,
+                  manualSlots: c.manualSlots.filter((s) => s.id !== slotId),
+                }
+              : c,
+          ),
+        }));
+      },
+    }),
+    {
+      name: "bunk-storage",
+      storage: createJSONStorage(() => zustandStorage),
+      partialize: (state) => ({
+        courses: state.courses,
+        hiddenCourses: state.hiddenCourses,
+        autoDropOptOutBySemester: state.autoDropOptOutBySemester,
+        lastSyncTime: state.lastSyncTime,
+      }),
+      onRehydrateStorage: () => (state) => {
+        state?.setHasHydrated(true);
+      },
+    },
+  ),
+);
+
+// selector: get all duty leaves across courses (past only)
+export const selectAllDutyLeaves = (
+  courses: CourseBunkData[],
+): DutyLeaveInfo[] => {
+  const dutyLeaves: DutyLeaveInfo[] = [];
+  for (const course of courses) {
+    const pastBunks = filterPastBunks(course.bunks);
+    for (const bunk of pastBunks) {
+      if (bunk.isDutyLeave) {
+        dutyLeaves.push({
+          courseId: course.courseId,
+          courseName: course.config?.alias || course.courseName,
+          bunkId: bunk.id,
+          date: bunk.date,
+          timeSlot: bunk.timeSlot,
+          note: bunk.dutyLeaveNote,
+        });
+      }
+    }
+  }
+  return dutyLeaves;
+};
+
+// selector: calculate bunks stats for a course (past bunks only)
+export const selectCourseStats = (
+  course: CourseBunkData,
+  attendanceSnapshot?: CourseAttendanceSnapshot,
+): CourseBunkStats => {
+  const pastBunks = filterPastBunks(course.bunks);
+  const totalBunks = course.config ? 2 * course.config.credits + 1 : 0;
+  const dutyLeaveCount = pastBunks.filter((b) => b.isDutyLeave).length;
+  const markedPresentCount = pastBunks.filter((b) => b.isMarkedPresent).length;
+  // exclude duty leaves AND marked-present from used count
+  const usedBunks = pastBunks.filter(
+    (b) => !b.isDutyLeave && !b.isMarkedPresent,
+  ).length;
+  const bunksLeft = totalBunks - usedBunks;
+  const requiredFor80Now = attendanceSnapshot
+    ? Math.ceil(attendanceSnapshot.totalSessions * 0.8)
+    : null;
+  const bufferTo80Now =
+    attendanceSnapshot && requiredFor80Now !== null
+      ? attendanceSnapshot.attendedSessions - requiredFor80Now
+      : null;
+
+  return {
+    totalBunks,
+    dutyLeaveCount,
+    markedPresentCount,
+    usedBunks,
+    bunksLeft,
+    pastBunksCount: pastBunks.length,
+    requiredFor80Now,
+    bufferTo80Now,
+    heuristicBunksLeft: bunksLeft,
+    heuristicUncertainty: 1,
+  };
+};
+
+// selector: get display name (alias or original)
+export const getDisplayName = (course: CourseBunkData): string => {
+  return course.config?.alias || course.courseName;
+};

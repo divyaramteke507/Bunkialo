@@ -1,0 +1,157 @@
+import { useAttendanceUIStore } from "@/stores/attendance-ui-store";
+import { useBunkStore } from "@/stores/bunk-store";
+import { useTimetableStore } from "@/stores/timetable-store";
+import type { CourseBunkData, CourseConfig, ManualSlotInput } from "@/types";
+import * as Haptics from "expo-haptics";
+import { useCallback } from "react";
+
+export const useCourseActions = () => {
+  const {
+    updateCourseConfig,
+    addBunk,
+    addCustomCourse,
+    deleteCourse,
+    restoreCourse,
+    deleteCustomCourse,
+    setManualSlots,
+  } = useBunkStore();
+
+  const {
+    generateTimetable,
+    resolveConflict,
+    resolveAllPreferred,
+    revertConflictResolution,
+    conflicts,
+  } = useTimetableStore();
+  const { openModal, closeModal, toggleEditMode } = useAttendanceUIStore();
+
+  // config handlers
+  const handleSaveCourse = useCallback(
+    (courseId: string, config: CourseConfig, slots: ManualSlotInput[]) => {
+      updateCourseConfig(courseId, config);
+      setManualSlots(courseId, slots);
+      generateTimetable();
+      setTimeout(() => {
+        const currentConflicts = useTimetableStore.getState().conflicts;
+        if (currentConflicts.length > 0) {
+          openModal({ type: "slot-conflict" });
+        }
+      }, 100);
+    },
+    [generateTimetable, openModal, setManualSlots, updateCourseConfig],
+  );
+
+  // add bunk handler
+  const handleAddBunk = useCallback(
+    (course: CourseBunkData, date: string, timeSlot: string, note: string) => {
+      addBunk(course.courseId, {
+        date,
+        description: "Manual entry",
+        timeSlot,
+        note,
+        isDutyLeave: false,
+        dutyLeaveNote: "",
+        isMarkedPresent: false,
+        presenceNote: "",
+      });
+      closeModal();
+    },
+    [addBunk, closeModal],
+  );
+
+  // create course handler
+  const handleCreateCourse = useCallback(
+    (
+      courseName: string,
+      alias: string,
+      credits: number,
+      color: string,
+      slots: ManualSlotInput[],
+    ) => {
+      addCustomCourse({ courseName, alias, credits, color, slots });
+      generateTimetable();
+      closeModal();
+      // check for conflicts after generating
+      setTimeout(() => {
+        const currentConflicts = useTimetableStore.getState().conflicts;
+        if (currentConflicts.length > 0) {
+          openModal({ type: "slot-conflict" });
+        }
+      }, 100);
+    },
+    [addCustomCourse, closeModal, generateTimetable, openModal],
+  );
+
+  // delete custom course
+  const handleDeleteCourse = useCallback(
+    (courseId: string) => {
+      deleteCourse(courseId);
+      generateTimetable();
+    },
+    [deleteCourse, generateTimetable],
+  );
+
+  const handleDeleteCustomCourse = useCallback(
+    (courseId: string) => {
+      deleteCustomCourse(courseId);
+      generateTimetable();
+    },
+    [deleteCustomCourse, generateTimetable],
+  );
+
+  const handleRestoreCourse = useCallback(
+    (courseId: string, keepVisibleForSemesterKey?: string) => {
+      restoreCourse(courseId, {
+        keepVisibleForSemesterKey,
+      });
+      generateTimetable();
+    },
+    [generateTimetable, restoreCourse],
+  );
+
+  const handleResolveConflict = useCallback(
+    (
+      conflictIndex: number,
+      keep: "preferred" | "alternative" | "keep-outlier" | "ignore-outlier",
+    ) => {
+      resolveConflict(conflictIndex, keep);
+    },
+    [resolveConflict],
+  );
+
+  const handleResolveAllPreferred = useCallback(() => {
+    resolveAllPreferred();
+  }, [resolveAllPreferred]);
+
+  const handleRevertConflict = useCallback(
+    (conflictId: string) => {
+      revertConflictResolution(conflictId);
+    },
+    [revertConflictResolution],
+  );
+
+  const handleOpenCreateCourse = useCallback(() => {
+    openModal({ type: "create-course" });
+    Haptics.selectionAsync();
+  }, [openModal]);
+
+  const handleToggleEditMode = useCallback(() => {
+    toggleEditMode();
+    Haptics.selectionAsync();
+  }, [toggleEditMode]);
+
+  return {
+    handleSaveCourse,
+    handleAddBunk,
+    handleCreateCourse,
+    handleDeleteCourse,
+    handleDeleteCustomCourse,
+    handleRestoreCourse,
+    handleResolveConflict,
+    handleResolveAllPreferred,
+    handleRevertConflict,
+    handleOpenCreateCourse,
+    handleToggleEditMode,
+    conflicts,
+  };
+};

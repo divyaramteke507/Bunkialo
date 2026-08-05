@@ -1,0 +1,494 @@
+import { Colors } from "@/constants/theme";
+import { useColorScheme } from "@/hooks/use-color-scheme";
+import type {
+  AttendanceRecord,
+  BunkRecord,
+  CourseAttendance,
+  CourseBunkData,
+} from "@/types";
+import {
+  buildRecordKey,
+  filterCompletedAttendanceRecords,
+  getRecordKeyVariants,
+  parseTimeSlot,
+} from "@/utils/attendance-helpers";
+import { Ionicons } from "@expo/vector-icons";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { FlatList, Modal, Pressable, Text, View } from "react-native";
+
+interface UnknownStatusModalProps {
+  visible: boolean;
+  courses: CourseAttendance[];
+  bunkCourses?: CourseBunkData[];
+  onClose: () => void;
+  onConfirmPresent: (courseId: string, record: AttendanceRecord) => void;
+  onConfirmAbsent: (courseId: string, record: AttendanceRecord) => void;
+  onRevert: (courseId: string, record: AttendanceRecord) => void;
+}
+
+type UnknownResolution = "assumedPresent" | "present" | "absent" | "dutyLeave";
+
+interface UnknownEntry {
+  courseId: string;
+  courseName: string;
+  record: AttendanceRecord;
+  resolution: UnknownResolution;
+  bunkId: string | null;
+  note: string;
+}
+
+const getUnknownEntryKey = (
+  courseId: string,
+  record: AttendanceRecord,
+): string => `${courseId}-${buildRecordKey(record.date, record.description)}`;
+
+// parse date for display
+const formatDate = (dateStr: string): string => {
+  const match = dateStr.match(/(\w{3})\s+(\d{1,2})\s+(\w{3})/);
+  if (match) return `${match[2]} ${match[3]}`;
+  return dateStr.slice(0, 15);
+};
+
+export function UnknownStatusModal({
+  visible,
+  courses,
+  bunkCourses,
+  onClose,
+  onConfirmPresent,
+  onConfirmAbsent,
+  onRevert,
+}: UnknownStatusModalProps) {
+  const colorScheme = useColorScheme();
+  const isDark = colorScheme === "dark";
+  const theme = isDark ? Colors.dark : Colors.light;
+  const [optimisticResolutionByKey, setOptimisticResolutionByKey] = useState<
+    Record<string, UnknownResolution>
+  >({});
+  const [pendingByKey, setPendingByKey] = useState<Record<string, boolean>>({});
+  const pendingTimeoutsRef = useRef<
+    Record<string, ReturnType<typeof setTimeout>>
+  >({});
+
+  const bunkLookup = useMemo(() => {
+    const map = new Map<string, Map<string, BunkRecord>>();
+    if (!bunkCourses) return map;
+    for (const course of bunkCourses) {
+      const courseMap = new Map<string, BunkRecord>();
+      for (const bunk of course.bunks) {
+        for (const key of getRecordKeyVariants(bunk)) {
+          courseMap.set(key, bunk);
+        }
+      }
+      map.set(course.courseId, courseMap);
+    }
+    return map;
+  }, [bunkCourses]);
+
+  const courseNameById = useMemo(() => {
+    const map = new Map<string, string>();
+    if (!bunkCourses) return map;
+    for (const course of bunkCourses) {
+      map.set(course.courseId, course.config?.alias || course.courseName);
+    }
+    return map;
+  }, [bunkCourses]);
+
+  const baseUnknownEntries = useMemo((): UnknownEntry[] => {
+    const entries: UnknownEntry[] = [];
+    for (const course of courses) {
+      const pastRecords = filterCompletedAttendanceRecords(course.records);
+      for (const record of pastRecords) {
+        if (record.status === "Unknown") {
+          const matchingBunk = getRecordKeyVariants(record)
+            .map((key) => bunkLookup.get(course.courseId)?.get(key))
+            .find((value): value is BunkRecord => value !== undefined);
+          let resolution: UnknownResolution = "assumedPresent";
+          let note = "";
+          if (matchingBunk) {
+            if (matchingBunk.isDutyLeave) {
+              resolution = "dutyLeave";
+              note = matchingBunk.dutyLeaveNote;
+            } else if (matchingBunk.isMarkedPresent) {
+              resolution = "present";
+              note = matchingBunk.presenceNote;
+            } else if (!matchingBunk.isMarkedPresent) {
+              resolution = "absent";
+              note = matchingBunk.note;
+            }
+          }
+          entries.push({
+            courseId: course.courseId,
+            courseName:
+              courseNameById.get(course.courseId) || course.courseName,
+            record,
+            resolution,
+            bunkId: matchingBunk?.id ?? null,
+            note,
+          });
+        }
+      }
+    }
+    // Keep unresolved unknowns at the top; confirmed resolutions go last.
+    // Within each group, keep the existing date-descending ordering.
+    return entries.sort((a, b) => {
+      const aResolved = a.resolution !== "assumedPresent";
+      const bResolved = b.resolution !== "assumedPresent";
+      if (aResolved !== bResolved) return aResolved ? 1 : -1;
+      return b.record.date.localeCompare(a.record.date);
+    });
+  }, [courses, courseNameById, bunkLookup]);
+
+  const unknownEntries = useMemo((): UnknownEntry[] => {
+    return baseUnknownEntries
+      .map((entry) => {
+        const key = getUnknownEntryKey(entry.courseId, entry.record);
+        const optimisticResolution = optimisticResolutionByKey[key];
+        if (!optimisticResolution) return entry;
+        return { ...entry, resolution: optimisticResolution };
+      })
+      .sort((a, b) => {
+        const aResolved = a.resolution !== "assumedPresent";
+        const bResolved = b.resolution !== "assumedPresent";
+        if (aResolved !== bResolved) return aResolved ? 1 : -1;
+        return b.record.date.localeCompare(a.record.date);
+      });
+  }, [baseUnknownEntries, optimisticResolutionByKey]);
+
+  useEffect(() => {
+    const baseResolutionByKey = new Map<string, UnknownResolution>();
+    for (const entry of baseUnknownEntries) {
+      baseResolutionByKey.set(
+        getUnknownEntryKey(entry.courseId, entry.record),
+        entry.resolution,
+      );
+    }
+
+    const nextPending = { ...pendingByKey };
+    const nextOptimistic = { ...optimisticResolutionByKey };
+    let changed = false;
+
+    for (const key of Object.keys(pendingByKey)) {
+      const optimistic = optimisticResolutionByKey[key];
+      const actual = baseResolutionByKey.get(key);
+      if (optimistic && actual === optimistic) {
+        delete nextPending[key];
+        delete nextOptimistic[key];
+        const timer = pendingTimeoutsRef.current[key];
+        if (timer) {
+          clearTimeout(timer);
+          delete pendingTimeoutsRef.current[key];
+        }
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      setPendingByKey(nextPending);
+      setOptimisticResolutionByKey(nextOptimistic);
+    }
+  }, [baseUnknownEntries, optimisticResolutionByKey, pendingByKey]);
+
+  useEffect(() => {
+    return () => {
+      for (const key of Object.keys(pendingTimeoutsRef.current)) {
+        clearTimeout(pendingTimeoutsRef.current[key]);
+      }
+      pendingTimeoutsRef.current = {};
+    };
+  }, []);
+
+  const markPending = (key: string) => {
+    setPendingByKey((prev) => ({ ...prev, [key]: true }));
+    const existing = pendingTimeoutsRef.current[key];
+    if (existing) clearTimeout(existing);
+    pendingTimeoutsRef.current[key] = setTimeout(() => {
+      setPendingByKey((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+      delete pendingTimeoutsRef.current[key];
+    }, 1200);
+  };
+
+  const getResolutionMeta = (
+    resolution: UnknownResolution,
+  ): { label: string; color: string; icon: string } => {
+    switch (resolution) {
+      case "assumedPresent":
+        return {
+          label: "Assumed Present",
+          color: Colors.status.success,
+          icon: "checkmark-circle",
+        };
+      case "present":
+        return {
+          label: "Confirmed Present",
+          color: Colors.status.success,
+          icon: "checkmark-done-circle",
+        };
+      case "absent":
+        return {
+          label: "Marked Absent",
+          color: Colors.status.danger,
+          icon: "close-circle",
+        };
+      case "dutyLeave":
+        return {
+          label: "Marked DL",
+          color: Colors.status.info,
+          icon: "briefcase",
+        };
+      default:
+        return {
+          label: "Assumed Present",
+          color: Colors.status.success,
+          icon: "checkmark-circle",
+        };
+    }
+  };
+
+  const renderItem = ({ item }: { item: UnknownEntry }) => {
+    const time = parseTimeSlot(item.record.date);
+    const resolutionMeta = getResolutionMeta(item.resolution);
+    const entryKey = getUnknownEntryKey(item.courseId, item.record);
+    const isPending = pendingByKey[entryKey] === true;
+    return (
+      <View
+        className="mb-3 flex-row items-center justify-between rounded-2xl border px-3 py-3"
+        style={{
+          borderColor: theme.border,
+          backgroundColor: theme.surface,
+          shadowColor: "#000",
+          shadowOpacity: isDark ? 0.2 : 0.06,
+          shadowRadius: 10,
+          shadowOffset: { width: 0, height: 4 },
+          elevation: 2,
+        }}
+      >
+        <View
+          className="mr-3 h-full w-1.5 rounded-full"
+          style={{ backgroundColor: resolutionMeta.color }}
+        />
+        <View className="mr-2 flex-1">
+          <Text
+            className="text-sm font-medium"
+            style={{ color: theme.text }}
+            numberOfLines={1}
+          >
+            {item.courseName}
+          </Text>
+          <View className="mt-0.5 flex-row gap-2">
+            <Text className="text-xs" style={{ color: theme.textSecondary }}>
+              {formatDate(item.record.date)}
+            </Text>
+            {time && (
+              <Text className="text-xs" style={{ color: theme.textSecondary }}>
+                {time}
+              </Text>
+            )}
+          </View>
+          <View className="mt-1 flex-row items-center gap-1.5">
+            <Ionicons
+              name={resolutionMeta.icon as keyof typeof Ionicons.glyphMap}
+              size={14}
+              color={resolutionMeta.color}
+            />
+            <Text
+              className="text-xs font-medium"
+              style={{ color: resolutionMeta.color }}
+            >
+              {resolutionMeta.label}
+            </Text>
+            {item.resolution === "assumedPresent" ? (
+              <View
+                className="rounded-full px-2 py-0.5"
+                style={{ backgroundColor: `${Colors.status.unknown}22` }}
+              >
+                <Text
+                  className="text-[10px] font-semibold uppercase"
+                  style={{ color: Colors.status.unknown }}
+                >
+                  pending
+                </Text>
+              </View>
+            ) : null}
+          </View>
+          {item.note ? (
+            <Text
+              className="mt-0.5 text-[11px] italic"
+              style={{ color: theme.textSecondary }}
+              numberOfLines={2}
+            >
+              {item.note}
+            </Text>
+          ) : null}
+        </View>
+        <View className="flex-row gap-2">
+          {item.resolution === "assumedPresent" ? (
+            <>
+              <Pressable
+                onPress={() => {
+                  if (isPending) return;
+                  setOptimisticResolutionByKey((prev) => ({
+                    ...prev,
+                    [entryKey]: "present",
+                  }));
+                  markPending(entryKey);
+                  onConfirmPresent(item.courseId, item.record);
+                }}
+                disabled={isPending}
+                className="h-9 w-9 items-center justify-center rounded-full"
+                style={{
+                  backgroundColor: `${Colors.status.success}18`,
+                  borderWidth: 1,
+                  borderColor: `${Colors.status.success}55`,
+                  opacity: isPending ? 0.6 : 1,
+                }}
+              >
+                <Ionicons
+                  name="checkmark"
+                  size={18}
+                  color={Colors.status.success}
+                />
+              </Pressable>
+              <Pressable
+                onPress={() => {
+                  if (isPending) return;
+                  setOptimisticResolutionByKey((prev) => ({
+                    ...prev,
+                    [entryKey]: "absent",
+                  }));
+                  markPending(entryKey);
+                  onConfirmAbsent(item.courseId, item.record);
+                }}
+                disabled={isPending}
+                className="h-9 w-9 items-center justify-center rounded-full"
+                style={{
+                  backgroundColor: `${Colors.status.danger}18`,
+                  borderWidth: 1,
+                  borderColor: `${Colors.status.danger}55`,
+                  opacity: isPending ? 0.6 : 1,
+                }}
+              >
+                <Ionicons name="close" size={18} color={Colors.status.danger} />
+              </Pressable>
+            </>
+          ) : (
+            <Pressable
+              onPress={() => {
+                if (isPending) return;
+                setOptimisticResolutionByKey((prev) => ({
+                  ...prev,
+                  [entryKey]: "assumedPresent",
+                }));
+                markPending(entryKey);
+                onRevert(item.courseId, item.record);
+              }}
+              disabled={isPending}
+              className="h-9 w-9 items-center justify-center rounded-full"
+              style={{
+                backgroundColor: `${theme.textSecondary}1f`,
+                borderWidth: 1,
+                borderColor: `${theme.textSecondary}55`,
+                opacity: isPending ? 0.6 : 1,
+              }}
+            >
+              <Ionicons
+                name="arrow-undo"
+                size={16}
+                color={theme.textSecondary}
+              />
+            </Pressable>
+          )}
+        </View>
+      </View>
+    );
+  };
+
+  return (
+    <Modal
+      visible={visible}
+      transparent
+      animationType="slide"
+      onRequestClose={onClose}
+    >
+      <View className="flex-1 justify-end">
+        <Pressable className="absolute inset-0 bg-black/50" onPress={onClose} />
+        <View
+          className="max-h-[72%] rounded-t-3xl px-5 pb-5 pt-3"
+          style={{ backgroundColor: theme.background }}
+        >
+          <View className="mb-2 items-center">
+            <View
+              className="h-1.5 w-14 rounded-full"
+              style={{ backgroundColor: theme.border }}
+            />
+          </View>
+          <View className="mb-2 flex-row items-center justify-between">
+            <View className="flex-row items-center gap-2">
+              <View
+                className="h-9 w-9 items-center justify-center rounded-full"
+                style={{ backgroundColor: Colors.status.unknown }}
+              >
+                <Ionicons name="help" size={18} color={Colors.white} />
+              </View>
+              <Text
+                className="text-[22px] font-semibold tracking-tight"
+                style={{ color: theme.text }}
+              >
+                Unknown Sessions
+              </Text>
+            </View>
+            <Pressable
+              onPress={onClose}
+              hitSlop={8}
+              className="h-9 w-9 items-center justify-center rounded-full"
+              style={{
+                backgroundColor: theme.surface,
+                borderWidth: 1,
+                borderColor: theme.border,
+              }}
+            >
+              <Ionicons name="close" size={22} color={theme.textSecondary} />
+            </Pressable>
+          </View>
+          <View className="mb-4 items-center">
+            <Text
+              className="max-w-[290px] text-center text-[10px] leading-4"
+              style={{ color: `${theme.textSecondary}BF` }}
+            >
+              Some faculty add slots without marking attendance. Update those
+              sessions manually here.
+            </Text>
+          </View>
+
+          {unknownEntries.length === 0 ? (
+            <View className="items-center gap-4 py-12">
+              <Ionicons
+                name="checkmark-circle"
+                size={48}
+                color={Colors.status.success}
+              />
+              <Text className="text-sm" style={{ color: theme.textSecondary }}>
+                No unknown sessions found
+              </Text>
+            </View>
+          ) : (
+            <>
+              <FlatList
+                data={unknownEntries}
+                keyExtractor={(item, idx) =>
+                  `${item.courseId}-${item.record.date}-${item.resolution}-${idx}`
+                }
+                renderItem={renderItem}
+                contentContainerStyle={{ paddingBottom: 4 }}
+                showsVerticalScrollIndicator={false}
+              />
+            </>
+          )}
+        </View>
+      </View>
+    </Modal>
+  );
+}
